@@ -2,16 +2,23 @@
 // Copyright © 2021 Billy Laws
 
 #include <array>
+#include <string>
+#include <unordered_map>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <errno.h>
 #include <dlfcn.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <android/dlext.h>
 #include <android/log.h>
 #include <android/api-level.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
+#include <limits.h>
 #include "elf_soname_patcher.h"
 #include "android_linker_ns.h"
 
@@ -19,6 +26,115 @@ using loader_android_create_namespace_t = android_namespace_t *(*)(const char *,
 static loader_android_create_namespace_t loader_android_create_namespace;
 
 static bool lib_loaded;
+static std::once_flag driver_subst_once;
+static std::unordered_map<std::string, std::string> driver_subst_map;
+static bool driver_subst_ready;
+
+static bool str_ends_with(const char *str, const char *suffix) {
+    if (!str || !suffix)
+        return false;
+
+    const size_t str_len{strlen(str)};
+    const size_t suffix_len{strlen(suffix)};
+    if (str_len < suffix_len)
+        return false;
+
+    return memcmp(str + (str_len - suffix_len), suffix, suffix_len) == 0;
+}
+
+static void add_driver_subst(const std::string &key, const std::string &path) {
+    if (key.empty() || path.empty())
+        return;
+
+    driver_subst_map[key] = path;
+}
+
+static void init_driver_subst_map() {
+    static constexpr const char *kDriverDirEnv{"ADRENOTOOLS_DRIVER_PATH"};
+    static constexpr const char *kAliasSoname{"vulkan.adreno.so"};
+
+    const char *dir{getenv(kDriverDirEnv)};
+    if (!dir || !dir[0]) {
+        __android_log_print(ANDROID_LOG_INFO, "linkernsbypass",
+                            "driver substitution disabled (no %s)",
+                            kDriverDirEnv);
+        return;
+    }
+
+    DIR *dp{opendir(dir)};
+    if (!dp) {
+        __android_log_print(ANDROID_LOG_ERROR, "linkernsbypass",
+                            "driver substitution: failed to open %s (errno=%d)",
+                            dir, errno);
+        return;
+    }
+
+    struct dirent *ent{};
+    char full_path[PATH_MAX];
+    while ((ent = readdir(dp)) != nullptr) {
+        const char *name{ent->d_name};
+        if (name[0] == '.' &&
+            (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+            continue;
+
+        if (!str_ends_with(name, ".so"))
+            continue;
+
+        if (strncmp(name, "not", 3) == 0)
+            continue;
+
+        const int n{snprintf(full_path, sizeof(full_path), "%s/%s", dir, name)};
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof(full_path))
+            continue;
+
+        struct stat st{};
+        if (stat(full_path, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+
+        const std::string full_path_str{full_path};
+        const std::string basename{name};
+        if (strncmp(name, "vulkan.", 7) == 0) {
+            std::string lib_alias{"lib"};
+            lib_alias += basename;
+            add_driver_subst(lib_alias, full_path_str);
+            add_driver_subst(kAliasSoname, full_path_str);
+            add_driver_subst(basename, full_path_str);
+        } else {
+            add_driver_subst(basename, full_path_str);
+        }
+    }
+
+    closedir(dp);
+
+    if (!driver_subst_map.empty()) {
+        driver_subst_ready = true;
+        __android_log_print(ANDROID_LOG_INFO, "linkernsbypass",
+                            "driver substitution: loaded %zu mapping(s) from %s",
+                            driver_subst_map.size(), dir);
+    } else {
+        __android_log_print(ANDROID_LOG_INFO, "linkernsbypass",
+                            "driver substitution: no usable .so entries in %s",
+                            dir);
+    }
+}
+
+static const char *resolve_driver_subst(const char *filename) {
+    if (!filename || !filename[0])
+        return filename;
+
+    std::call_once(driver_subst_once, init_driver_subst_map);
+    if (!driver_subst_ready)
+        return filename;
+
+    const char *basename{strrchr(filename, '/')};
+    basename = basename ? basename + 1 : filename;
+
+    const auto it{driver_subst_map.find(basename)};
+    if (it == driver_subst_map.end())
+        return filename;
+
+    return it->second.c_str();
+}
 
 
 /* Public API */
@@ -62,12 +178,19 @@ bool linkernsbypass_link_namespace_to_default_all_libs(android_namespace_t *to) 
 }
 
 void *linkernsbypass_namespace_dlopen(const char *filename, int flags, android_namespace_t *ns) {
+    const char *resolved_filename{resolve_driver_subst(filename)};
+    if (resolved_filename != filename) {
+        __android_log_print(ANDROID_LOG_INFO, "linkernsbypass",
+                            "driver substitution: %s -> %s",
+                            filename ? filename : "(null)", resolved_filename);
+    }
+
     android_dlextinfo extInfo{
         .flags = ANDROID_DLEXT_USE_NAMESPACE,
         .library_namespace = ns
     };
 
-    return android_dlopen_ext(filename, flags, &extInfo);
+    return android_dlopen_ext(resolved_filename, flags, &extInfo);
 }
 
 #ifndef __NR_memfd_create
